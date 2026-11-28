@@ -40,7 +40,7 @@ use foundry_evm_core::{
 };
 use foundry_evm_coverage::HitMaps;
 use foundry_evm_networks::arbitrum;
-use foundry_evm_traces::{SparsedTraceArena, TraceRequirements};
+use foundry_evm_traces::{SparsedTraceArena, TraceRequirements, TransientStorageTracer};
 use std::{
     mem,
     ops::{Deref, DerefMut},
@@ -460,6 +460,7 @@ pub struct InspectorStackInner {
     pub script_execution_inspector: Option<Box<ScriptExecutionInspector>>,
     pub tempo_labels: Option<Box<TempoLabels>>,
     pub tracer: Option<Box<TracingInspector>>,
+    pub transient_storage_tracer: Option<Box<TransientStorageTracer>>,
 
     // FoundryInspectorExt and other internal data.
     /// Whether to collect sancov edge coverage from instrumented native crates.
@@ -1031,12 +1032,18 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
         self.revert_diag = config.is_some().then(RevertDiagnostic::default).map(Into::into);
 
         if let Some(config) = config {
+            if config.record_state_diff {
+                self.transient_storage_tracer.get_or_insert_with(Default::default);
+            } else {
+                self.transient_storage_tracer = None;
+            }
             match &mut self.tracer {
                 Some(tracer) => *tracer.config_mut() = config,
                 None => self.tracer = Some(Box::new(TracingInspector::new(config))),
             }
         } else {
             self.tracer = None;
+            self.transient_storage_tracer = None;
         }
         if requirements.debug_recording() {
             self.debug_recorder.get_or_insert_with(Default::default);
@@ -1047,13 +1054,22 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
     }
 
     /// Replaces the tracer, such as with one taken before changing the trace requirements.
-    /// Revert diagnostics only annotate trace nodes, so they follow the tracer.
+    /// Revert diagnostics and transient storage tracing only annotate trace nodes, so they follow
+    /// the tracer.
     #[inline]
     pub fn set_tracer(&mut self, tracer: Option<Box<TracingInspector>>) {
-        if tracer.is_none() {
+        if let Some(tracer) = tracer.as_deref() {
+            if self.revert_diag.is_none() {
+                self.revert_diag = Some(Default::default());
+            }
+            if tracer.config().record_state_diff {
+                self.transient_storage_tracer.get_or_insert_with(Default::default);
+            } else {
+                self.transient_storage_tracer = None;
+            }
+        } else {
             self.revert_diag = None;
-        } else if self.revert_diag.is_none() {
-            self.revert_diag = Some(Default::default());
+            self.transient_storage_tracer = None;
         }
         self.tracer = tracer;
         self.refresh_static_opcode_dispatch();
@@ -1096,6 +1112,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
                     log_collector,
                     tempo_labels,
                     tracer,
+                    transient_storage_tracer,
                     revert_diag,
                     reverter,
                     ..
@@ -1104,6 +1121,8 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
 
         let trace_diagnostics =
             revert_diag.map(|revert_diag| revert_diag.into_diagnostics()).unwrap_or_default();
+        let transient_storage =
+            transient_storage_tracer.map(|transient| transient.into_changes()).unwrap_or_default();
 
         let traces = tracer.map(|tracer| tracer.into_traces()).map(|arena| {
             let ignored = cheatcodes
@@ -1124,6 +1143,7 @@ impl<FEN: FoundryEvmNetwork> InspectorStack<FEN> {
                 arena,
                 ignored,
                 diagnostics: trace_diagnostics,
+                transient_storage,
                 debug_steps: debug_recorder.as_deref_mut().map(DebugRecorder::finish),
             };
             traces.lift_single_top_level_call();
@@ -1232,14 +1252,18 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
         let backend = Some(&mut *self.backend);
         let cheats = self.cheatcodes.as_deref_mut();
         'inspectors: {
-            if let Some(tracer) = &mut self.inner.tracer
-                && changed!(
+            if let Some(tracer) = &mut self.inner.tracer {
+                let changed = changed!(
                     result,
                     stop,
                     Inspector::<TypesFor<FEN>>::call_end(&mut **tracer, interp, message, result)
-                )
-            {
-                break 'inspectors;
+                );
+                if let Some(transient) = self.inner.transient_storage_tracer.as_deref_mut() {
+                    transient.exit_node();
+                }
+                if changed {
+                    break 'inspectors;
+                }
             }
             if let Some(recorder) = &mut self.inner.debug_recorder {
                 Inspector::<TypesFor<FEN>>::call_end(&mut **recorder, interp, message, result);
@@ -1293,14 +1317,18 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
             {
                 break 'inspectors;
             }
-            if let Some(tracer) = &mut self.inner.tracer
-                && changed!(
+            if let Some(tracer) = &mut self.inner.tracer {
+                let changed = changed!(
                     result,
                     stop,
                     Inspector::<TypesFor<FEN>>::create_end(&mut **tracer, interp, message, result)
-                )
-            {
-                break 'inspectors;
+                );
+                if let Some(transient) = self.inner.transient_storage_tracer.as_deref_mut() {
+                    transient.exit_node();
+                }
+                if changed {
+                    break 'inspectors;
+                }
             }
             if let Some(recorder) = &mut self.inner.debug_recorder {
                 Inspector::<TypesFor<FEN>>::create_end(&mut **recorder, interp, message, result);
@@ -1987,6 +2015,11 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
                     ],
                     |inspector| Inspector::<TypesFor<FEN>>::step(&mut **inspector, interp),
                 );
+                if let Some(tracer) = inner.tracer.as_deref()
+                    && let Some(transient) = inner.transient_storage_tracer.as_deref_mut()
+                {
+                    transient.start_step(interp, tracer);
+                }
             } else if let Some(script) = inner.script_execution_inspector.as_deref_mut() {
                 Inspector::<TypesFor<FEN>>::step(script, interp);
             }
@@ -2006,12 +2039,15 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
         }
 
         // evm2 skips `step_end` if an inspector halted the frame in `step`. Only a stack with step
-        // inspectors can hold a recorder, so other stacks skip the check.
-        if static_end_stepped
-            && let Some(recorder) = self.inner.debug_recorder.as_deref_mut()
-            && interp.result().is_err()
-        {
-            recorder.end_step_not_run();
+        // inspectors can hold a recorder or transient storage tracer, so other stacks skip the
+        // check.
+        if static_end_stepped && interp.result().is_err() {
+            if let Some(recorder) = self.inner.debug_recorder.as_deref_mut() {
+                recorder.end_step_not_run();
+            }
+            if let Some(transient) = self.inner.transient_storage_tracer.as_deref_mut() {
+                transient.end_step_not_run();
+            }
         }
     }
 
@@ -2038,6 +2074,9 @@ impl<FEN: FoundryEvmNetwork> InspectorStackRefMut<'_, FEN> {
                 ],
                 |inspector| Inspector::<TypesFor<FEN>>::step_end(&mut **inspector, interp),
             );
+            if let Some(transient) = inner.transient_storage_tracer.as_deref_mut() {
+                transient.end_step(interp);
+            }
         }
 
         if self.inner.stepped & STEPPED_CHEAT != 0
@@ -2332,6 +2371,9 @@ impl<FEN: FoundryEvmNetwork> Inspector<TypesFor<FEN>> for InspectorStackRefMut<'
             self.inner
                 .pending_call_traces
                 .push(PendingCallTrace { trace_idx, executed_address: None });
+            if let Some(transient) = self.inner.transient_storage_tracer.as_deref_mut() {
+                transient.enter_node(trace_idx);
+            }
             if let Some(revert_diag) = self.inner.revert_diag.as_deref_mut() {
                 revert_diag.set_trace_node(trace_idx);
             }
@@ -2522,6 +2564,9 @@ impl<FEN: FoundryEvmNetwork> Inspector<TypesFor<FEN>> for InspectorStackRefMut<'
             crate::utils::cold_path();
             let output = Inspector::<TypesFor<FEN>>::create(tracer, interp, message);
             let trace_idx = tracer.traces().nodes().len() - 1;
+            if let Some(transient) = self.inner.transient_storage_tracer.as_deref_mut() {
+                transient.enter_node(trace_idx);
+            }
             if let Some(revert_diag) = self.inner.revert_diag.as_deref_mut() {
                 revert_diag.set_trace_node(trace_idx);
             }

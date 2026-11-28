@@ -114,6 +114,9 @@ pub mod speedscope;
 
 pub mod erc8021;
 
+mod transient;
+pub use transient::{TransientStorageChange, TransientStorageChangeReason, TransientStorageTracer};
+
 pub type Traces = Vec<(TraceKind, SparsedTraceArena)>;
 
 /// Presentation-only detail for an otherwise empty EVM revert.
@@ -150,6 +153,9 @@ pub struct SparsedTraceArena {
     /// Presentation-only revert diagnostics, keyed by trace node index.
     #[serde(default, skip_serializing_if = "HashMap::is_empty")]
     pub diagnostics: HashMap<usize, RevertDiagnostic>,
+    /// Transient storage accesses (`TLOAD` / `TSTORE`) recorded per trace node index.
+    #[serde(default, skip_serializing_if = "BTreeMap::is_empty")]
+    pub transient_storage: BTreeMap<usize, Vec<TransientStorageChange>>,
     /// The opcode steps recorded for the debugger, if a debug recorder ran.
     #[serde(skip)]
     pub debug_steps: Option<debug::DebugRecording>,
@@ -166,10 +172,16 @@ impl Serialize for SparsedTraceArena {
             arena: &'a CallTraceArena,
             #[serde(skip_serializing_if = "HashMap::is_empty")]
             ignored: &'a HashMap<(usize, usize), (usize, usize)>,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            transient_storage: &'a BTreeMap<usize, Vec<TransientStorageChange>>,
         }
 
-        ResolvedArena { arena: &self.resolve_diagnostics(), ignored: &self.ignored }
-            .serialize(serializer)
+        ResolvedArena {
+            arena: &self.resolve_diagnostics(),
+            ignored: &self.ignored,
+            transient_storage: &self.transient_storage,
+        }
+        .serialize(serializer)
     }
 }
 
@@ -315,6 +327,10 @@ impl SparsedTraceArena {
             .into_iter()
             .filter_map(|(node_idx, diagnostic)| Some((node_idx.checked_sub(1)?, diagnostic)))
             .collect();
+        self.transient_storage = std::mem::take(&mut self.transient_storage)
+            .into_iter()
+            .filter_map(|(node_idx, changes)| Some((node_idx.checked_sub(1)?, changes)))
+            .collect();
         if let Some(debug_steps) = &mut self.debug_steps {
             debug_steps.frames.remove(0);
             debug_steps.frames.iter_mut().for_each(|frame| frame.depth -= 1);
@@ -359,9 +375,9 @@ impl DerefMut for SparsedTraceArena {
 /// Decode a collection of call traces.
 ///
 /// The traces will be decoded using the given decoder, if possible.
-pub async fn decode_trace_arena(arena: &mut CallTraceArena, decoder: &CallTraceDecoder) {
-    decoder.prefetch_signatures(arena.nodes()).await;
-    decoder.populate_traces(arena.nodes_mut()).await;
+pub async fn decode_trace_arena(arena: &mut SparsedTraceArena, decoder: &CallTraceDecoder) {
+    decoder.prefetch_signatures(arena.arena.nodes()).await;
+    decoder.populate_traces_with_transient(arena.arena.nodes_mut(), &arena.transient_storage).await;
 }
 
 /// Render a collection of call traces to a string.
@@ -380,8 +396,11 @@ pub fn prune_trace_depth(arena: &mut CallTraceArena, depth: usize) {
 
 /// Returns a serializable trace arena containing only nodes visible at `depth`.
 pub fn trace_arena_at_depth(arena: &SparsedTraceArena, depth: usize) -> SparsedTraceArena {
-    let mut arena = arena.resolve_arena().into_owned();
-    let nodes = arena.nodes_mut();
+    let has_ignored = !arena.ignored.is_empty();
+    let mut resolved = arena.resolve_arena().into_owned();
+    let resolved_transient =
+        transient::filter_resolved_changes(&resolved, &arena.transient_storage, has_ignored);
+    let nodes = resolved.nodes_mut();
     let mut reachable = vec![false; nodes.len()];
     let mut pending = vec![0];
     while let Some(node_idx) = pending.pop() {
@@ -435,10 +454,16 @@ pub fn trace_arena_at_depth(arena: &SparsedTraceArena, depth: usize) -> SparsedT
         }
     }
 
+    let transient_storage = resolved_transient
+        .into_iter()
+        .filter_map(|(node_idx, changes)| Some((remapped.get(node_idx).copied()??, changes)))
+        .collect();
+
     SparsedTraceArena {
-        arena,
+        arena: resolved,
         ignored: Default::default(),
         diagnostics: Default::default(),
+        transient_storage,
         debug_steps: None,
     }
 }
@@ -450,8 +475,29 @@ pub fn render_trace_arena_inner(
     with_bytecodes: bool,
     with_storage_changes: bool,
 ) -> String {
+    let has_ignored = !arena.ignored.is_empty();
     if shell::is_json() {
-        return serde_json::to_string(&arena.resolve_arena()).expect("Failed to serialize traces");
+        let resolved = arena.resolve_arena();
+        if arena.transient_storage.is_empty() {
+            return serde_json::to_string(resolved.as_ref()).expect("Failed to serialize traces");
+        }
+        #[derive(Serialize)]
+        struct ResolvedJsonArena<'a> {
+            #[serde(flatten)]
+            arena: &'a CallTraceArena,
+            #[serde(skip_serializing_if = "BTreeMap::is_empty")]
+            transient_storage: BTreeMap<usize, Vec<TransientStorageChange>>,
+        }
+        let transient_storage = transient::filter_resolved_changes(
+            resolved.as_ref(),
+            &arena.transient_storage,
+            has_ignored,
+        );
+        return serde_json::to_string(&ResolvedJsonArena {
+            arena: resolved.as_ref(),
+            transient_storage,
+        })
+        .expect("Failed to serialize traces");
     }
 
     let mut resolved = arena.resolve_arena();
@@ -488,6 +534,19 @@ pub fn render_trace_arena_inner(
     w.write_arena(resolved.as_ref()).expect("Failed to write traces");
     let mut rendered =
         String::from_utf8(w.into_writer()).expect("trace writer wrote invalid UTF-8");
+
+    if with_storage_changes
+        && let Some(with_transient) = transient::inject_transient_storage_changes(
+            &rendered,
+            resolved.as_ref(),
+            &arena.transient_storage,
+            with_bytecodes,
+            has_ignored,
+        )
+    {
+        rendered = with_transient;
+    }
+
     if let Some(tempo_changes) = tempo_changes {
         if !rendered.ends_with('\n') {
             rendered.push('\n');
@@ -876,14 +935,16 @@ mod tests {
         let tx = TypesFor::<FEN>::tx_from_request(request).unwrap();
         assert!(evm.transact(&tx).unwrap().commit().status);
 
-        let mut arena = evm.clear_inspector_as::<TracingInspector>().unwrap().into_traces();
-        decode_trace_arena(&mut arena, &CallTraceDecoder::new().clone()).await;
-        render_trace_arena(&SparsedTraceArena {
+        let arena = evm.clear_inspector_as::<TracingInspector>().unwrap().into_traces();
+        let mut traces = SparsedTraceArena {
             arena,
             ignored: Default::default(),
             diagnostics: Default::default(),
+            transient_storage: Default::default(),
             debug_steps: None,
-        })
+        };
+        decode_trace_arena(&mut traces, &CallTraceDecoder::new().clone()).await;
+        render_trace_arena(&traces)
     }
 
     async fn tracing_suite<FEN: FoundryEvmNetwork>()
@@ -959,6 +1020,7 @@ mod tests {
             arena,
             ignored: Default::default(),
             diagnostics: Default::default(),
+            transient_storage: Default::default(),
             debug_steps: None,
         };
 
@@ -1023,6 +1085,7 @@ mod tests {
                 arena,
                 ignored: Default::default(),
                 diagnostics: Default::default(),
+                transient_storage: Default::default(),
                 debug_steps: None,
             },
             false,
@@ -1042,6 +1105,7 @@ mod tests {
                 0,
                 RevertDiagnostic::CallToNonContract(alloy_primitives::Address::ZERO),
             )]),
+            transient_storage: Default::default(),
             debug_steps: None,
         };
 
@@ -1070,6 +1134,7 @@ mod tests {
                 0,
                 RevertDiagnostic::CallToNonContract(alloy_primitives::Address::ZERO),
             )]),
+            transient_storage: Default::default(),
             debug_steps: None,
         };
 

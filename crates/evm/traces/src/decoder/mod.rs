@@ -1,6 +1,6 @@
 use crate::{
     CallTrace, CallTraceArena, CallTraceNode, DecodedCallData, DecodedCallLog, DecodedCallTrace,
-    DecodedTraceStep,
+    DecodedTraceStep, TransientStorageChange, TransientStorageChangeReason,
     debug::DebugTraceIdentifier,
     erc8021,
     identifier::{IdentifiedAddress, LocalTraceIdentifier, SignaturesIdentifier, TraceIdentifier},
@@ -1035,31 +1035,55 @@ impl CallTraceDecoder {
     /// [CallTrace] in place. See [CallTraceDecoder::decode_function] and
     /// [CallTraceDecoder::decode_event] for more details.
     pub async fn populate_traces(&self, traces: &mut Vec<CallTraceNode>) {
+        self.populate_traces_inner(traces, None).await;
+    }
+
+    /// Populates the traces with decoded data, using `transient_storage` to annotate `TLOAD` and
+    /// `TSTORE` opcode lines when requested via [`Self::opcodes`].
+    pub async fn populate_traces_with_transient(
+        &self,
+        traces: &mut Vec<CallTraceNode>,
+        transient_storage: &BTreeMap<usize, Vec<TransientStorageChange>>,
+    ) {
+        self.populate_traces_inner(traces, Some(transient_storage)).await;
+    }
+
+    async fn populate_traces_inner(
+        &self,
+        traces: &mut Vec<CallTraceNode>,
+        transient_storage: Option<&BTreeMap<usize, Vec<TransientStorageChange>>>,
+    ) {
         for node in traces {
             if !self.opcodes.is_empty() {
-                for step in &mut node.trace.steps {
+                let transient_changes =
+                    transient_storage.and_then(|map| map.get(&node.idx)).map(Vec::as_slice);
+                for (step_idx, step) in node.trace.steps.iter_mut().enumerate() {
                     if step.decoded().is_some() || !self.opcodes.contains(&step.op) {
                         continue;
                     }
-                    let res = match &step.storage_change {
-                        Some(change) if step.op == OpCode::SSTORE => {
-                            if let Some(had_value) = change.had_value {
-                                format!(
-                                    "[{}] {} {:#x}: {:#x} → {:#x}",
-                                    step.gas_cost, step.op, change.key, had_value, change.value
-                                )
-                            } else {
-                                format!(
-                                    "[{}] {} {:#x} → ({:#x})",
-                                    step.gas_cost, step.op, change.key, change.value
-                                )
-                            }
-                        }
-                        Some(change) => format!(
-                            "[{}] {} {:#x} → ({:#x})",
-                            step.gas_cost, step.op, change.key, change.value
-                        ),
-                        None => format!("[{}] {}", step.gas_cost, step.op),
+                    let res = if let Some(change) = &step.storage_change {
+                        format_storage_opcode_step(
+                            step.gas_cost,
+                            step.op,
+                            change.key,
+                            change.had_value,
+                            change.value,
+                            step.op == OpCode::SSTORE,
+                        )
+                    } else if let Some(changes) = transient_changes
+                        && let Ok(idx) = changes.binary_search_by_key(&step_idx, |c| c.step_idx)
+                    {
+                        let change = &changes[idx];
+                        format_storage_opcode_step(
+                            step.gas_cost,
+                            step.op,
+                            change.key,
+                            change.had_value,
+                            change.value,
+                            change.reason == TransientStorageChangeReason::TSTORE,
+                        )
+                    } else {
+                        format!("[{}] {}", step.gas_cost, step.op)
                     };
 
                     *step.decoded_mut() = DecodedTraceStep::Line(res);
@@ -1994,6 +2018,22 @@ fn redact_cheatcode_secret_output(func: &Function) -> Option<&'static str> {
         "promptSecret" | "promptSecretUint" => Some("<secret>"),
         "rpcUrl" | "rpcUrls" | "rpcUrlStructs" => Some("<rpc url>"),
         _ => None,
+    }
+}
+
+/// Formats a decoded storage or transient storage opcode step line for `--opcodes`.
+fn format_storage_opcode_step(
+    gas_cost: u64,
+    op: OpCode,
+    key: U256,
+    had_value: Option<U256>,
+    value: U256,
+    is_store: bool,
+) -> String {
+    if is_store && let Some(had_value) = had_value {
+        format!("[{gas_cost}] {op} {key:#x}: {had_value:#x} → {value:#x}")
+    } else {
+        format!("[{gas_cost}] {op} {key:#x} → ({value:#x})")
     }
 }
 

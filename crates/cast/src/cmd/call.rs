@@ -571,6 +571,7 @@ impl CallArgs {
                 arena: call_frame_to_arena(&frame, None),
                 ignored: Default::default(),
                 diagnostics: Default::default(),
+                transient_storage: Default::default(),
                 debug_steps: None,
             };
             let result = TraceResult {

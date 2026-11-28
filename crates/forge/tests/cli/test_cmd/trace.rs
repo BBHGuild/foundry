@@ -905,3 +905,406 @@ contract BoxTest {
 "#]]);
     }
 }
+
+#[forgetest_init]
+fn transient_storage_traces_and_opcodes(prj: _, cmd: _) {
+    prj.add_source(
+        "TransientDemo.sol",
+        r#"
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+contract TransientHelper {
+    function bump(uint256 slot, uint256 value) external {
+        assembly {
+            tstore(slot, value)
+        }
+    }
+}
+
+contract TransientCtor {
+    constructor(uint256 value) {
+        assembly {
+            tstore(5, value)
+        }
+    }
+}
+
+contract TransientDemo {
+    uint256 public persisted;
+
+    function storeBothAndCompact(address helper) external returns (uint256 loaded) {
+        persisted = 1;
+        assembly {
+            // Net-zero reentrancy guard: 0 -> 1 -> 0 (omitted from summary).
+            tstore(0, 1)
+            // Compacted writes: slot 2 written first, then updated after slot 1.
+            tstore(2, 10)
+            tstore(1, 20)
+            tstore(2, 30)
+            // Read back slot 2.
+            loaded := tload(2)
+            tstore(0, 0)
+        }
+        // Delegatecall modifies caller's transient slot 2 (30 -> 40).
+        (bool ok,) = helper.delegatecall(abi.encodeCall(TransientHelper.bump, (2, 40)));
+        require(ok);
+        // Constructor transient write.
+        new TransientCtor(99);
+    }
+
+    function staticTstore() external {
+        assembly {
+            tstore(7, 1)
+        }
+    }
+
+    function internalWrapper(TransientHelper helper) external {
+        _innerCall(helper);
+    }
+
+    function _innerCall(TransientHelper helper) internal {
+        helper.bump(3, 77);
+    }
+}
+"#,
+    );
+    prj.add_test(
+        "TransientDemo.t.sol",
+        r#"
+// SPDX-License-Identifier: MIT
+pragma solidity ^0.8.24;
+
+import "forge-std/Test.sol";
+import "../src/TransientDemo.sol";
+
+contract TransientDemoTest is Test {
+    TransientDemo demo;
+    TransientHelper helper;
+
+    function setUp() public {
+        demo = new TransientDemo();
+        helper = new TransientHelper();
+    }
+
+    function test_TransientStorageSummary() public {
+        uint256 loaded = demo.storeBothAndCompact(address(helper));
+        assertEq(loaded, 30);
+    }
+
+    function test_StaticCallTstoreHaltsWithoutChange() public view {
+        (bool ok,) = address(demo).staticcall(abi.encodeCall(TransientDemo.staticTstore, ()));
+        assertFalse(ok);
+    }
+
+    function test_DecodeInternalWithTransient() public {
+        demo.internalWrapper(helper);
+    }
+
+    function test_PauseTracingHidesTransient() public {
+        vm.pauseTracing();
+        assembly {
+            tstore(8, 123)
+        }
+        helper.bump(8, 123);
+        vm.resumeTracing();
+        helper.bump(9, 456);
+    }
+}
+"#,
+    );
+
+    // -vvvvv shows persistent and transient storage changes, compaction, delegatecall had_value,
+    // constructor tstore, and omits net-zero reentrancy guard writes.
+    cmd.forge_fuse()
+        .args(["test", "--mt", "test_TransientStorageSummary", "-vvvvv", "--no-dynamic-test-linking"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+...
+Ran 1 test for test/TransientDemo.t.sol:TransientDemoTest
+[PASS] test_TransientStorageSummary() ([GAS])
+Traces:
+  [..] TransientDemoTest::setUp()
+...
+  [..] TransientDemoTest::test_TransientStorageSummary()
+    ├─ [..] TransientDemo::storeBothAndCompact(TransientHelper: [0x2e234DAe75C793f67A35089C9d99245E1C58470b])
+    │   ├─ [..] TransientHelper::bump(2, 40) [delegatecall]
+    │   │   ├─  transient storage changes:
+    │   │   │   @ 2: 30 → 40
+    │   │   └─ ← [Stop]
+    │   ├─ [..] → new TransientCtor@[..]
+    │   │   ├─  transient storage changes:
+    │   │   │   @ 5: 0 → 99
+    │   │   └─ ← [Return] [..] bytes of code
+    │   ├─  storage changes:
+    │   │   @ 0: 0 → 1
+    │   ├─  transient storage changes:
+    │   │   @ 1: 0 → 20
+    │   │   @ 2: 0 → 30
+    │   └─ ← [Return] 30
+    └─ ← [Stop]
+
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+"#]]);
+
+    // -vvvv does not display transient storage changes.
+    cmd.forge_fuse()
+        .args(["test", "--mt", "test_TransientStorageSummary", "-vvvv", "--no-dynamic-test-linking"])
+        .assert_success()
+        .stdout_eq(str![[r#"
+...
+Ran 1 test for test/TransientDemo.t.sol:TransientDemoTest
+[PASS] test_TransientStorageSummary() ([GAS])
+Traces:
+  [..] TransientDemoTest::test_TransientStorageSummary()
+    ├─ [..] TransientDemo::storeBothAndCompact(TransientHelper: [0x2e234DAe75C793f67A35089C9d99245E1C58470b])
+    │   ├─ [..] TransientHelper::bump(2, 40) [delegatecall]
+    │   │   └─ ← [Stop]
+    │   ├─ [..] → new TransientCtor@[..]
+    │   │   └─ ← [Return] [..] bytes of code
+    │   └─ ← [Return] 30
+    └─ ← [Stop]
+
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+"#]]);
+
+    // --opcodes TSTORE,TLOAD emits inline decoded lines (including net-zero lock/unlock) and
+    // deduplicates the transient storage changes summary.
+    cmd.forge_fuse()
+        .args([
+            "test",
+            "--mt",
+            "test_TransientStorageSummary",
+            "-vvvvv",
+            "--opcodes",
+            "TSTORE,TLOAD",
+            "--no-dynamic-test-linking",
+        ])
+        .assert_success()
+        .stdout_eq(str![[r#"
+...
+Ran 1 test for test/TransientDemo.t.sol:TransientDemoTest
+[PASS] test_TransientStorageSummary() ([GAS])
+Traces:
+  [..] TransientDemoTest::setUp()
+...
+  [..] TransientDemoTest::test_TransientStorageSummary()
+    ├─ [..] TransientDemo::storeBothAndCompact(TransientHelper: [0x2e234DAe75C793f67A35089C9d99245E1C58470b])
+    │   ├─ [100] TSTORE 0x0: 0x0 → 0x1
+    │   ├─ [100] TSTORE 0x2: 0x0 → 0xa
+    │   ├─ [100] TSTORE 0x1: 0x0 → 0x14
+    │   ├─ [100] TSTORE 0x2: 0xa → 0x1e
+    │   ├─ [100] TLOAD 0x2 → (0x1e)
+    │   ├─ [100] TSTORE 0x0: 0x1 → 0x0
+    │   ├─ [..] TransientHelper::bump(2, 40) [delegatecall]
+    │   │   ├─ [100] TSTORE 0x2: 0x1e → 0x28
+    │   │   └─ ← [Stop]
+    │   ├─ [..] → new TransientCtor@[..]
+    │   │   ├─ [100] TSTORE 0x5: 0x0 → 0x63
+    │   │   └─ ← [Return] [..] bytes of code
+    │   ├─  storage changes:
+    │   │   @ 0: 0 → 1
+    │   └─ ← [Return] 30
+    └─ ← [Stop]
+
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+"#]]);
+
+    // --opcodes TLOAD alone still displays the transient storage changes summary.
+    cmd.forge_fuse()
+        .args([
+            "test",
+            "--mt",
+            "test_TransientStorageSummary",
+            "-vvvvv",
+            "--opcodes",
+            "TLOAD",
+            "--no-dynamic-test-linking",
+        ])
+        .assert_success()
+        .stdout_eq(str![[r#"
+...
+Ran 1 test for test/TransientDemo.t.sol:TransientDemoTest
+[PASS] test_TransientStorageSummary() ([GAS])
+Traces:
+  [..] TransientDemoTest::setUp()
+...
+  [..] TransientDemoTest::test_TransientStorageSummary()
+    ├─ [..] TransientDemo::storeBothAndCompact(TransientHelper: [0x2e234DAe75C793f67A35089C9d99245E1C58470b])
+    │   ├─ [100] TLOAD 0x2 → (0x1e)
+    │   ├─ [..] TransientHelper::bump(2, 40) [delegatecall]
+    │   │   ├─  transient storage changes:
+    │   │   │   @ 2: 30 → 40
+    │   │   └─ ← [Stop]
+    │   ├─ [..] → new TransientCtor@[..]
+    │   │   ├─  transient storage changes:
+    │   │   │   @ 5: 0 → 99
+    │   │   └─ ← [Return] [..] bytes of code
+    │   ├─  storage changes:
+    │   │   @ 0: 0 → 1
+    │   ├─  transient storage changes:
+    │   │   @ 1: 0 → 20
+    │   │   @ 2: 0 → 30
+    │   └─ ← [Return] 30
+    └─ ← [Stop]
+
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+"#]]);
+
+    // A halted TSTORE inside STATICCALL must not emit a transient storage change.
+    cmd.forge_fuse()
+        .args([
+            "test",
+            "--mt",
+            "test_StaticCallTstoreHaltsWithoutChange",
+            "-vvvvv",
+            "--no-dynamic-test-linking",
+        ])
+        .assert_success()
+        .stdout_eq(str![[r#"
+...
+Ran 1 test for test/TransientDemo.t.sol:TransientDemoTest
+[PASS] test_StaticCallTstoreHaltsWithoutChange() ([GAS])
+Traces:
+  [..] TransientDemoTest::setUp()
+...
+  [..] TransientDemoTest::test_StaticCallTstoreHaltsWithoutChange()
+    ├─ [..] TransientDemo::staticTstore() [staticcall]
+    │   └─ ← [StateChangeDuringStaticCall] EvmError: StateChangeDuringStaticCall
+    └─ ← [Stop]
+
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+"#]]);
+
+    // --decode-internal aligns transient storage changes properly inside nested internal frames.
+    cmd.forge_fuse()
+        .args([
+            "test",
+            "--mt",
+            "test_DecodeInternalWithTransient",
+            "-vvvvv",
+            "--decode-internal",
+            "--no-dynamic-test-linking",
+        ])
+        .assert_success()
+        .stdout_eq(str![[r#"
+...
+Ran 1 test for test/TransientDemo.t.sol:TransientDemoTest
+[PASS] test_DecodeInternalWithTransient() ([GAS])
+Traces:
+  [..] TransientDemoTest::setUp()
+...
+  [..] TransientDemoTest::test_DecodeInternalWithTransient()
+    ├─ [..] TransientDemo::internalWrapper(TransientHelper: [0x2e234DAe75C793f67A35089C9d99245E1C58470b])
+    │   ├─ [..] TransientDemo::_innerCall(address)(0x2e234DAe75C793f67A35089C9d99245E1C58470b)
+    │   │   ├─ [..] TransientHelper::bump(3, 77)
+    │   │   │   ├─  transient storage changes:
+    │   │   │   │   @ 3: 0 → 77
+    │   │   │   └─ ← [Stop]
+    │   │   └─ ← 
+    │   └─ ← [Stop]
+    └─ ← [Stop]
+
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+"#]]);
+
+    // vm.pauseTracing() hides transient writes executed while paused.
+    cmd.forge_fuse()
+        .args([
+            "test",
+            "--mt",
+            "test_PauseTracingHidesTransient",
+            "-vvvvv",
+            "--no-dynamic-test-linking",
+        ])
+        .assert_success()
+        .stdout_eq(str![[r#"
+...
+Ran 1 test for test/TransientDemo.t.sol:TransientDemoTest
+[PASS] test_PauseTracingHidesTransient() ([GAS])
+Traces:
+  [..] TransientDemoTest::setUp()
+...
+  [..] TransientDemoTest::test_PauseTracingHidesTransient()
+    ├─ [0] VM::pauseTracing() [staticcall]
+    │   └─ ← [Return]
+    ├─ [0] VM::resumeTracing() [staticcall]
+    │   └─ ← [Return]
+    ├─ [..] TransientHelper::bump(9, 456)
+    │   ├─  transient storage changes:
+    │   │   @ 9: 0 → 456
+    │   └─ ← [Stop]
+    └─ ← [Stop]
+
+Suite result: ok. 1 passed; 0 failed; 0 skipped; [ELAPSED]
+
+Ran 1 test suite [ELAPSED]: 1 tests passed, 0 failed, 0 skipped (1 total tests)
+
+"#]]);
+
+    // JSON traces keep TSTORE/TLOAD step.storage_change null and expose typed transient_storage.
+    let output = cmd
+        .forge_fuse()
+        .args([
+            "test",
+            "--mt",
+            "test_TransientStorageSummary",
+            "-vvvvv",
+            "--json",
+            "--no-dynamic-test-linking",
+        ])
+        .assert_success();
+    let json: serde_json::Value =
+        serde_json::from_slice(&output.get_output().stdout).expect("valid JSON output");
+    let suite = &json["test/TransientDemo.t.sol:TransientDemoTest"]["test_results"];
+    let test_result = &suite["test_TransientStorageSummary()"];
+    let exec_trace = test_result["traces"]
+        .as_array()
+        .unwrap()
+        .iter()
+        .find(|entry| entry[0] == "Execution")
+        .expect("execution trace present");
+    let arena_obj = &exec_trace[1];
+
+    // No TSTORE/TLOAD step may be mislabelled in persistent `storage_change`.
+    for node in arena_obj["arena"].as_array().unwrap() {
+        for step in node["trace"]["steps"].as_array().unwrap() {
+            if matches!(step["op"].as_str(), Some("TSTORE" | "TLOAD")) {
+                assert!(
+                    step["storage_change"].is_null(),
+                    "transient opcode must not populate persistent storage_change: {step}"
+                );
+            }
+        }
+    }
+
+    let transient = arena_obj["transient_storage"]
+        .as_object()
+        .expect("transient_storage present in JSON trace");
+    assert_eq!(transient.len(), 3, "expected 3 nodes with transient accesses: {transient:?}");
+    let reasons: Vec<&str> = transient
+        .values()
+        .flat_map(|v| v.as_array().unwrap())
+        .map(|entry| entry["reason"].as_str().unwrap())
+        .collect();
+    assert!(reasons.contains(&"TSTORE"));
+    assert!(reasons.contains(&"TLOAD"));
+}

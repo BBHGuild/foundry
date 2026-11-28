@@ -15,14 +15,19 @@ use foundry_common::{ErrorExt, fmt::ConsoleFmt};
 use foundry_evm_core::{
     abi::console, constants::HARDHAT_CONSOLE_ADDRESS, decode::decode_console_logs,
 };
-use foundry_evm_traces::{CallTraceDecoder, SparsedTraceArena, render_trace_arena_inner};
-use std::sync::Arc;
+use foundry_evm_traces::{
+    CallTraceDecoder, SparsedTraceArena, TransientStorageChange, TransientStorageTracer,
+    render_trace_arena_inner,
+};
+use std::{collections::BTreeMap, sync::Arc};
 
 /// The [`evm2::Inspector`] used when transacting in the evm.
 #[derive(Clone, Debug, Default)]
 pub struct AnvilInspector {
     /// Collects all traces
     pub tracer: Option<TracingInspector>,
+    /// Collects transient storage accesses alongside `tracer` when printing traces.
+    transient_storage_tracer: Option<TransientStorageTracer>,
     /// Collects all `console.sol` logs
     pub log_collector: Option<LogCollector>,
     /// Collects canonical and synthetic transfer logs for an `eth_simulateV1` response.
@@ -204,7 +209,12 @@ impl AnvilInspector {
     /// Consumes the type and prints the traces.
     pub fn into_print_traces(mut self, decoder: Arc<CallTraceDecoder>) {
         if let Some(a) = self.tracer.take() {
-            print_traces(a, decoder);
+            let transient_storage = self
+                .transient_storage_tracer
+                .take()
+                .map(TransientStorageTracer::into_changes)
+                .unwrap_or_default();
+            print_traces(a, transient_storage, decoder);
         }
     }
 
@@ -212,7 +222,12 @@ impl AnvilInspector {
     /// This will log all traces
     pub fn print_traces(&self, decoder: Arc<CallTraceDecoder>) {
         if let Some(a) = self.tracer.clone() {
-            print_traces(a, decoder);
+            let transient_storage = self
+                .transient_storage_tracer
+                .as_ref()
+                .map(|t| t.changes().clone())
+                .unwrap_or_default();
+            print_traces(a, transient_storage, decoder);
         }
     }
 
@@ -265,6 +280,7 @@ impl AnvilInspector {
     /// Configures the `Tracer` [`evm2::Inspector`] with a trace printer.
     pub fn with_trace_printer(mut self) -> Self {
         self.tracer = Some(TracingInspector::new(TracingInspectorConfig::all().with_state_diffs()));
+        self.transient_storage_tracer = Some(TransientStorageTracer::default());
         self
     }
 }
@@ -276,7 +292,11 @@ impl AnvilInspector {
 /// # Panics
 ///
 /// If called outside tokio runtime
-fn print_traces(tracer: TracingInspector, decoder: Arc<CallTraceDecoder>) {
+fn print_traces(
+    tracer: TracingInspector,
+    transient_storage: BTreeMap<usize, Vec<TransientStorageChange>>,
+    decoder: Arc<CallTraceDecoder>,
+) {
     let arena = tokio::task::block_in_place(move || {
         tokio::runtime::Handle::current().block_on(async move {
             let mut arena = tracer.into_traces();
@@ -289,6 +309,7 @@ fn print_traces(tracer: TracingInspector, decoder: Arc<CallTraceDecoder>) {
         arena,
         ignored: Default::default(),
         diagnostics: Default::default(),
+        transient_storage,
         debug_steps: None,
     };
     let trace = render_trace_arena_inner(&traces, false, true);
@@ -320,12 +341,18 @@ impl<T: EvmTypes> Inspector<T> for AnvilInspector {
         }
         if let Some(tracer) = self.tracer.as_mut().filter(|_| self.tracer_depth > 0) {
             Inspector::<T>::step(tracer, interp);
+            if let Some(transient) = &mut self.transient_storage_tracer {
+                transient.start_step(interp, tracer);
+            }
         }
     }
 
     fn step_end(&mut self, interp: &mut Interpreter<'_, '_, T>) {
         if let Some(tracer) = self.tracer.as_mut().filter(|_| self.tracer_depth > 0) {
             Inspector::<T>::step_end(tracer, interp);
+            if let Some(transient) = &mut self.transient_storage_tracer {
+                transient.end_step(interp);
+            }
         }
         if let Some(collector) = &mut self.simulation_logs {
             collector.sync_journal_logs(interp.host().logs());
@@ -360,8 +387,12 @@ impl<T: EvmTypes> Inspector<T> for AnvilInspector {
         }
         if let Some(tracer) = &mut self.tracer {
             self.tracer_depth += 1;
-            if let Some(result) = Inspector::<T>::call(tracer, interp, message) {
-                return Some(result);
+            let result = Inspector::<T>::call(tracer, interp, message);
+            if let Some(transient) = &mut self.transient_storage_tracer {
+                transient.enter_node(tracer.traces().nodes().len() - 1);
+            }
+            if result.is_some() {
+                return result;
             }
         }
         if let Some(collector) = &mut self.log_collector
@@ -390,6 +421,9 @@ impl<T: EvmTypes> Inspector<T> for AnvilInspector {
         if let Some(tracer) = &mut self.tracer {
             self.tracer_depth = self.tracer_depth.saturating_sub(1);
             Inspector::<T>::call_end(tracer, interp, message, result);
+            if let Some(transient) = &mut self.transient_storage_tracer {
+                transient.exit_node();
+            }
         }
         if let Some(collector) = &mut self.simulation_logs {
             let logs = interp.host().logs();
@@ -410,7 +444,11 @@ impl<T: EvmTypes> Inspector<T> for AnvilInspector {
         }
         if let Some(tracer) = &mut self.tracer {
             self.tracer_depth += 1;
-            return Inspector::<T>::create(tracer, interp, message);
+            let result = Inspector::<T>::create(tracer, interp, message);
+            if let Some(transient) = &mut self.transient_storage_tracer {
+                transient.enter_node(tracer.traces().nodes().len() - 1);
+            }
+            return result;
         }
         None
     }
@@ -424,6 +462,9 @@ impl<T: EvmTypes> Inspector<T> for AnvilInspector {
         if let Some(tracer) = &mut self.tracer {
             self.tracer_depth = self.tracer_depth.saturating_sub(1);
             Inspector::<T>::create_end(tracer, interp, message, result);
+            if let Some(transient) = &mut self.transient_storage_tracer {
+                transient.exit_node();
+            }
         }
         if let Some(collector) = &mut self.simulation_logs {
             let logs = interp.host().logs();
